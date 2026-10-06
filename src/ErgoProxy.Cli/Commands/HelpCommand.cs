@@ -6,7 +6,7 @@ public static class HelpCommand
 {
     public static void Execute()
     {
-        AnsiConsole.MarkupLine("[bold cyan]ERGOPROXY: Cross-Platform HTTP Proxy Manager[/] [dim](v1.0)[/]\n");
+        AnsiConsole.MarkupLine("[bold cyan]ERGOPROXY: Device-Wide HTTP Proxy Tunnel[/] [dim](v2.0)[/]\n");
         Console.WriteLine("USAGE:");
         Console.WriteLine("  ergoproxy                  Launch interactive terminal interface (TUI)");
         Console.WriteLine("  ergoproxy <command> [opts] Run non-interactive CLI command\n");
@@ -18,20 +18,21 @@ public static class HelpCommand
         Console.WriteLine("                        [--bypass <rules>] [--id <id>]");
         Console.WriteLine("  profiles     List all configured proxy profiles");
         Console.WriteLine("               Options: [--json]");
-        Console.WriteLine("  test         Test connectivity to proxy endpoint");
+        Console.WriteLine("  test         Test connectivity and HTTP CONNECT to proxy endpoint");
         Console.WriteLine("               Options: [--id <id>] [--endpoint <url>] [--timeout <sec>] [--json]");
-        Console.WriteLine("  connect      Activate selected profile as system proxy");
-        Console.WriteLine("               Options: [--id <id>] [--force]");
-        Console.WriteLine("  disconnect   Deactivate system proxy and restore previous settings");
-        Console.WriteLine("               Options: [--force]");
-        Console.WriteLine("  status       Show current proxy configuration and connection status");
+        Console.WriteLine("  connect      Establish device-wide tunnel through proxy");
+        Console.WriteLine("               Options: [<profile_name_or_id>] [--id <id>]");
+        Console.WriteLine("  disconnect   Deactivate tunnel and restore normal system networking");
+        Console.WriteLine("  status       Show current tunnel state, traffic statistics, and protocols");
         Console.WriteLine("               Options: [--json]");
+        Console.WriteLine("  recover      Clean up stale TUN interfaces, routing rules, or DNS");
+        Console.WriteLine("  daemon       Run background tunnel controller daemon (root)");
+        Console.WriteLine("               Options: [--socket <path>] [--uid <uid>] [--detach]");
         Console.WriteLine("  help         Display this help information\n");
 
         Console.WriteLine("EXIT CODES:");
         Console.WriteLine("  0   Success");
-        Console.WriteLine("  1   Configuration / validation error");
-        Console.WriteLine("  2   Network / connectivity test failure");
-        Console.WriteLine("  3   Platform conflict or unsupported operation\n");
+        Console.WriteLine("  1   Configuration, privilege, or tunnel establishment error");
+        Console.WriteLine("  2   Network or proxy test failure\n");
     }
 }

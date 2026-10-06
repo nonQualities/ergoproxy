@@ -18,7 +18,7 @@ public static class Theme
                 .Color(Primary));
 
         AnsiConsole.Write(
-            new Markup("[bold grey]Cross-Platform HTTP Proxy Manager[/] [dim]v1.0 (Linux | Windows | macOS)[/]\n\n")
+            new Markup("[bold grey]Device-Wide HTTP Proxy Tunnel[/] [dim]v2.0 (Linux TUN + CONNECT)[/]\n\n")
                 .Centered());
     }
 

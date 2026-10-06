@@ -7,9 +7,7 @@ public static class DisconnectCommand
 {
     public static async Task<int> ExecuteAsync(IProxyService proxyService, string[] args, CancellationToken ct = default)
     {
-        var force = args.Contains("--force") || args.Contains("-f");
-
-        var result = await proxyService.DisconnectAsync(force, ct);
+        var result = await proxyService.DisconnectAsync(ct);
 
         if (result.Success)
         {
@@ -17,7 +15,7 @@ public static class DisconnectCommand
             return 0;
         }
 
-        Theme.ShowError($"Deactivation failed: {result.Message}");
-        return 3;
+        Theme.ShowError($"Disconnect failed: {result.Message}");
+        return 1;
     }
 }

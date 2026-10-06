@@ -1,10 +1,12 @@
 using ErgoProxy.Cli.Commands;
 using ErgoProxy.Core.Credentials;
+using ErgoProxy.Core.Daemon;
 using ErgoProxy.Core.Models;
 using ErgoProxy.Core.Network;
 using ErgoProxy.Core.Security;
 using ErgoProxy.Core.Services;
 using ErgoProxy.Core.Storage;
+using ErgoProxy.Core.Tunnel;
 using ErgoProxy.Core.Validation;
 using ErgoProxy.Tests.Helpers;
 using Xunit;
@@ -19,7 +21,7 @@ public class AcceptanceTests : IDisposable
     private readonly EncryptedFileCredentialStore _credentialStore;
     private readonly ProfileValidator _validator;
     private readonly ProxyTester _proxyTester;
-    private readonly MockPlatformAdapter _mockPlatform;
+    private readonly MockTunnelPlatform _mockPlatform;
     private readonly ProxyService _proxyService;
 
     public AcceptanceTests()
@@ -32,14 +34,17 @@ public class AcceptanceTests : IDisposable
         _credentialStore = new EncryptedFileCredentialStore(Path.Combine(_testDir, "vault.enc"));
         _validator = new ProfileValidator();
         _proxyTester = new ProxyTester(_validator);
-        _mockPlatform = new MockPlatformAdapter();
+        _mockPlatform = new MockTunnelPlatform();
+
+        var socketPath = Path.Combine(_testDir, "test_control.sock");
+        var daemonClient = new DaemonClient(socketPath);
 
         _proxyService = new ProxyService(
             _profileRepo,
             _stateManager,
             _credentialStore,
             _proxyTester,
-            _mockPlatform,
+            daemonClient,
             _validator);
     }
 
@@ -179,7 +184,6 @@ public class AcceptanceTests : IDisposable
     [Fact]
     public async Task AT_06_UnreachableEndpoint_TerminatesWithinTimeoutAndReportsFailure()
     {
-        // Non-routable address (TEST-NET-1 RFC 5737) to test timeout bounded behavior
         var profile = new ProxyProfile
         {
             Id = "at-06-timeout",
@@ -227,7 +231,7 @@ public class AcceptanceTests : IDisposable
             HttpsTestHost = "localhost",
             HttpsTestPort = testProxy.Port,
             TestHttpsConnectTunnel = true,
-            ValidateTlsCertificate = false // In-memory self-signed test cert
+            ValidateTlsCertificate = false
         };
 
         var result = await _proxyService.TestProfileAsync(profile.Id, options);
@@ -236,119 +240,45 @@ public class AcceptanceTests : IDisposable
     }
 
     [Fact]
-    public async Task AT_08_EnableSystemProxy_IntendedSettingsAppliedAndVerified()
+    public async Task AT_08_TunnelLifecycle_StartAndStop_ActivatesAndRestoresCleanly()
     {
-        var profile = new ProxyProfile
+        await using var testProxy = new TestProxyServer { RequireAuth = false };
+
+        var mockDevice = new MockPacketDevice();
+        var addressing = new TunnelAddressing { InterfaceName = "mock0" };
+        var controller = new TunnelController(
+            addressing,
+            _mockPlatform,
+            deviceFactory: _ => mockDevice);
+
+        var startReq = new TunnelStartRequest
         {
-            Id = "at-08-profile",
-            Name = "System Proxy Profile",
-            Host = "10.0.0.50",
-            Port = 8080,
-            BypassRules = new List<string> { "localhost", "10.0.0.0/8" }
+            ProfileName = "Test-Tunnel",
+            ProxyHost = testProxy.Host,
+            ProxyPort = testProxy.Port,
+            ProbeHost = "localhost",
+            ProbePort = testProxy.Port
         };
-        await _proxyService.SaveProfileAsync(profile);
 
-        var result = await _proxyService.ConnectAsync(profile.Id);
-        Assert.True(result.Success);
+        // 1. Start tunnel
+        var status = await controller.StartAsync(startReq);
+        Assert.Equal(TunnelState.Connected, status.State);
+        Assert.True(_mockPlatform.IsNetworkSetup);
+        Assert.Equal(1, _mockPlatform.SetupCount);
 
-        // Verify with mock platform
-        var currentOs = await _mockPlatform.GetCurrentSettingsAsync();
-        Assert.True(currentOs.Enabled);
-        Assert.Equal("10.0.0.50", currentOs.HttpHost);
-        Assert.Equal(8080, currentOs.HttpPort);
-
-        // Verify state
-        var state = await _stateManager.GetStateAsync();
-        Assert.True(state.IsSystemProxyApplied);
-        Assert.Equal("at-08-profile", state.ActiveProfileId);
+        // 2. Stop tunnel
+        var stopStatus = await controller.StopAsync();
+        Assert.Equal(TunnelState.Disconnected, stopStatus.State);
+        Assert.False(_mockPlatform.IsNetworkSetup);
+        Assert.Equal(1, _mockPlatform.TearDownCount);
     }
 
     [Fact]
-    public async Task AT_09_DisableSystemProxy_PreviousSettingsRestoredSafely()
+    public async Task AT_09_SecretRedaction_PasswordsDoNotAppearInLogsOrPlaintextFiles()
     {
-        // Initial OS state: Proxy was previously pointed to old.corp.proxy:3128
-        _mockPlatform.CurrentSettings = new SystemProxyConfiguration
-        {
-            Enabled = true,
-            HttpHost = "old.corp.proxy",
-            HttpPort = 3128,
-            BypassRules = new List<string> { "corp.local" }
-        };
-
         var profile = new ProxyProfile
         {
             Id = "at-09-profile",
-            Name = "New Proxy",
-            Host = "new.proxy",
-            Port = 8080
-        };
-        await _proxyService.SaveProfileAsync(profile);
-
-        // Enable new proxy (with force since existing was enabled)
-        var connectResult = await _proxyService.ConnectAsync(profile.Id, force: true);
-        Assert.True(connectResult.Success);
-        Assert.Equal("new.proxy", _mockPlatform.CurrentSettings.HttpHost);
-
-        // Disable proxy
-        var disconnectResult = await _proxyService.DisconnectAsync();
-        Assert.True(disconnectResult.Success);
-
-        // Assert previous settings were faithfully restored!
-        Assert.True(_mockPlatform.CurrentSettings.Enabled);
-        Assert.Equal("old.corp.proxy", _mockPlatform.CurrentSettings.HttpHost);
-        Assert.Equal(3128, _mockPlatform.CurrentSettings.HttpPort);
-        Assert.Contains("corp.local", _mockPlatform.CurrentSettings.BypassRules);
-
-        var state = await _stateManager.GetStateAsync();
-        Assert.False(state.IsSystemProxyApplied);
-    }
-
-    [Fact]
-    public async Task AT_10_ExternalSettingsChanged_DetectsConflictAvoidsOverwriting()
-    {
-        var profile = new ProxyProfile
-        {
-            Id = "at-10-profile",
-            Name = "Test Conflict",
-            Host = "managed.proxy",
-            Port = 8080
-        };
-        await _proxyService.SaveProfileAsync(profile);
-
-        // 1. External settings already active before apply
-        _mockPlatform.CurrentSettings.Enabled = true;
-        _mockPlatform.CurrentSettings.HttpHost = "external.configured.proxy";
-        _mockPlatform.CurrentSettings.HttpPort = 9000;
-
-        // Apply without force should detect conflict
-        var result = await _proxyService.ConnectAsync(profile.Id, force: false);
-        Assert.False(result.Success);
-        Assert.True(result.HasConflict);
-
-        // Apply with force should proceed
-        var forceResult = await _proxyService.ConnectAsync(profile.Id, force: true);
-        Assert.True(forceResult.Success);
-
-        // 2. External tampering while active
-        _mockPlatform.CurrentSettings.HttpHost = "tampered.proxy";
-        _mockPlatform.CurrentSettings.HttpPort = 4444;
-
-        // Disconnect without force should detect external tampering
-        var disconnectResult = await _proxyService.DisconnectAsync(force: false);
-        Assert.False(disconnectResult.Success);
-        Assert.Contains("modified externally", disconnectResult.Message);
-
-        // Force disconnect succeeds
-        var forceDisconnect = await _proxyService.DisconnectAsync(force: true);
-        Assert.True(forceDisconnect.Success);
-    }
-
-    [Fact]
-    public async Task AT_11_SecretRedaction_PasswordsDoNotAppearInLogsOrPlaintextFiles()
-    {
-        var profile = new ProxyProfile
-        {
-            Id = "at-11-profile",
             Name = "Secure Profile",
             Host = "proxy.secure.net",
             Port = 8080,
@@ -372,37 +302,42 @@ public class AcceptanceTests : IDisposable
     }
 
     [Fact]
-    public async Task AT_12_UnsupportedEnvironment_DeclinesUnsupportedChangesAndExplains()
+    public async Task AT_10_UnsupportedPlatform_ReportsErrorWithoutModifyingSystem()
     {
         _mockPlatform.IsSupported = false;
-        _mockPlatform.UnsupportedReason = "Headless environment without desktop proxy daemon.";
+        _mockPlatform.UnsupportedReason = "Platform not supported for tunnel.";
 
-        var profile = new ProxyProfile
+        var mockDevice = new MockPacketDevice();
+        var controller = new TunnelController(
+            new TunnelAddressing(),
+            _mockPlatform,
+            _ => mockDevice);
+
+        var startReq = new TunnelStartRequest
         {
-            Id = "at-12-profile",
-            Name = "Headless Profile",
-            Host = "10.0.0.1",
-            Port = 8080
+            ProfileName = "Unsupported-Tunnel",
+            ProxyHost = "127.0.0.1",
+            ProxyPort = 8080
         };
-        await _proxyService.SaveProfileAsync(profile);
 
-        var result = await _proxyService.ConnectAsync(profile.Id);
-        Assert.False(result.Success);
-        Assert.Contains("Headless environment", result.Message);
+        var status = await controller.StartAsync(startReq);
+        Assert.Equal(TunnelState.Error, status.State);
+        Assert.Equal(TunnelErrorKind.PlatformUnsupported, status.ErrorKind);
+        Assert.False(_mockPlatform.IsNetworkSetup);
     }
 
     [Fact]
-    public async Task AT_13_RestartApplication_ProfilesRemainAvailableAndStateAccurate()
+    public async Task AT_11_RestartApplication_ProfilesRemainAvailable()
     {
         var profile = new ProxyProfile
         {
-            Id = "at-13-persisted",
+            Id = "at-11-persisted",
             Name = "Persistent Profile",
             Host = "proxy.persist.org",
             Port = 8888
         };
         await _proxyService.SaveProfileAsync(profile);
-        await _proxyService.ConnectAsync(profile.Id);
+        await _proxyService.SetActiveProfileAsync(profile.Id);
 
         // Simulate app restart by constructing new instances pointing to same files
         var newProfileRepo = new JsonProfileRepository(Path.Combine(_testDir, "profiles.json"));
@@ -412,44 +347,20 @@ public class AcceptanceTests : IDisposable
             newStateManager,
             _credentialStore,
             _proxyTester,
-            _mockPlatform,
+            new DaemonClient(),
             _validator);
 
-        var loadedProfile = await newService.GetProfileAsync("at-13-persisted");
+        var loadedProfile = await newService.GetProfileAsync("at-11-persisted");
         Assert.NotNull(loadedProfile);
         Assert.Equal("Persistent Profile", loadedProfile.Name);
 
-        var status = await newService.GetStatusAsync();
-        Assert.True(status.IsSystemProxyApplied);
-        Assert.Equal("proxy.persist.org:8888", status.ConfiguredEndpoint);
+        var activeProfile = await newService.GetActiveProfileAsync();
+        Assert.NotNull(activeProfile);
+        Assert.Equal("at-11-persisted", activeProfile.Id);
     }
 
     [Fact]
-    public async Task AT_14_InterruptedActivation_RollsBackAndReportsPendingRecovery()
-    {
-        _mockPlatform.ShouldFailVerification = true;
-
-        var profile = new ProxyProfile
-        {
-            Id = "at-14-fail",
-            Name = "Failing Profile",
-            Host = "fail.proxy",
-            Port = 8080
-        };
-        await _proxyService.SaveProfileAsync(profile);
-
-        var result = await _proxyService.ConnectAsync(profile.Id);
-        Assert.False(result.Success);
-
-        // Verification failure must NOT leave profile marked active (FR-11)
-        var state = await _stateManager.GetStateAsync();
-        Assert.False(state.IsSystemProxyApplied);
-        Assert.True(state.HasPendingRecovery);
-        Assert.NotNull(state.RecoveryMessage);
-    }
-
-    [Fact]
-    public async Task AT_15_CliOperation_NonInteractiveCommandsReturnExitCodes()
+    public async Task AT_12_CliOperation_NonInteractiveCommandsReturnExitCodes()
     {
         // 1. configure command succeeds with exit code 0
         var cfgArgs = new[]
@@ -478,14 +389,6 @@ public class AcceptanceTests : IDisposable
         // 4. profiles command succeeds with exit code 0
         var profilesCode = await ProfilesCommand.ExecuteAsync(_proxyService, new[] { "--json" });
         Assert.Equal(0, profilesCode);
-
-        // 5. connect command succeeds with exit code 0
-        var connectCode = await ConnectCommand.ExecuteAsync(_proxyService, Array.Empty<string>());
-        Assert.Equal(0, connectCode);
-
-        // 6. disconnect command succeeds with exit code 0
-        var disconnectCode = await DisconnectCommand.ExecuteAsync(_proxyService, Array.Empty<string>());
-        Assert.Equal(0, disconnectCode);
     }
 
     public void Dispose()

@@ -1,7 +1,7 @@
 using ErgoProxy.Core.Models;
-using ErgoProxy.Core.Network;
-using ErgoProxy.Core.Platform;
 using ErgoProxy.Core.Services;
+using ErgoProxy.Core.Tunnel;
+using ErgoProxy.Core.Tunnel.Platform;
 using Spectre.Console;
 
 namespace ErgoProxy.Cli.UI;
@@ -34,13 +34,13 @@ public sealed class InteractiveMenu
                     .HighlightStyle(new Style(Color.Cyan1))
                     .AddChoices(new[]
                     {
-                        "⚡ Connect (Enable System Proxy)",
-                        "🔌 Disconnect (Restore System Proxy)",
+                        "⚡ Connect (Start Device-Wide Tunnel)",
+                        "🔌 Disconnect (Stop Tunnel & Restore Routes)",
                         "📋 Profile Management",
                         "🔍 Test Proxy Connectivity",
-                        "📊 View Detailed Status",
+                        "📊 View Detailed Status & Protocols",
                         "🔑 Manage Credentials",
-                        "🛠 System Diagnostics & Recovery",
+                        "🛠 Network Diagnostics & Recovery",
                         "❓ Help & Documentation",
                         "🚪 Exit Application"
                     }));
@@ -49,10 +49,10 @@ public sealed class InteractiveMenu
             {
                 switch (choice)
                 {
-                    case "⚡ Connect (Enable System Proxy)":
+                    case "⚡ Connect (Start Device-Wide Tunnel)":
                         await HandleConnectAsync(status, ct);
                         break;
-                    case "🔌 Disconnect (Restore System Proxy)":
+                    case "🔌 Disconnect (Stop Tunnel & Restore Routes)":
                         await HandleDisconnectAsync(ct);
                         break;
                     case "📋 Profile Management":
@@ -61,13 +61,13 @@ public sealed class InteractiveMenu
                     case "🔍 Test Proxy Connectivity":
                         await HandleTestAsync(status, ct);
                         break;
-                    case "📊 View Detailed Status":
+                    case "📊 View Detailed Status & Protocols":
                         await HandleViewStatusAsync(ct);
                         break;
                     case "🔑 Manage Credentials":
                         await HandleCredentialsAsync(status, ct);
                         break;
-                    case "🛠 System Diagnostics & Recovery":
+                    case "🛠 Network Diagnostics & Recovery":
                         await HandleDiagnosticsAsync(status, ct);
                         break;
                     case "❓ Help & Documentation":
@@ -98,37 +98,26 @@ public sealed class InteractiveMenu
 
         AnsiConsole.WriteLine();
         var confirm = AnsiConsole.Confirm(
-            $"Activate [cyan]{Markup.Escape(status.ActiveProfile.Name)}[/] ({status.ActiveProfile.Host}:{status.ActiveProfile.Port}) as system proxy?",
+            $"Establish device-wide tunnel through [cyan]{Markup.Escape(status.ActiveProfile.Name)}[/] ({status.ActiveProfile.Host}:{status.ActiveProfile.Port})?",
             defaultValue: true);
 
         if (!confirm) return;
 
-        ProxyApplyResult result = null!;
+        TunnelOperationResult result = null!;
         await AnsiConsole.Status()
             .Spinner(Spinner.Known.Dots)
-            .StartAsync("Applying system proxy settings...", async _ =>
+            .StartAsync("Establishing tunnel and configuring system routing...", async _ =>
             {
-                result = await _proxyService.ConnectAsync(status.ActiveProfile.Id, force: false, ct);
+                result = await _proxyService.ConnectAsync(status.ActiveProfile.Id, ct);
             });
 
         if (result.Success)
         {
             Theme.ShowSuccess(result.Message);
-        }
-        else if (result.HasConflict)
-        {
-            Theme.ShowWarning(result.Message);
-            if (AnsiConsole.Confirm("Do you wish to force-overwrite existing system settings?", defaultValue: false))
+            if (result.Status?.InterfaceName != null)
             {
-                await AnsiConsole.Status()
-                    .Spinner(Spinner.Known.Dots)
-                    .StartAsync("Force-applying system proxy settings...", async _ =>
-                    {
-                        result = await _proxyService.ConnectAsync(status.ActiveProfile.Id, force: true, ct);
-                    });
-
-                if (result.Success) Theme.ShowSuccess(result.Message);
-                else Theme.ShowError(result.Message);
+                AnsiConsole.MarkupLine($"[green]Tunnel Device:[/] [white]{result.Status.InterfaceName}[/]");
+                AnsiConsole.MarkupLine($"[green]DNS Mode:[/]      [white]{result.Status.DnsMode}[/]");
             }
         }
         else
@@ -140,15 +129,15 @@ public sealed class InteractiveMenu
     private async Task HandleDisconnectAsync(CancellationToken ct)
     {
         AnsiConsole.WriteLine();
-        var confirm = AnsiConsole.Confirm("Disable managed system proxy and restore previous settings?", defaultValue: true);
+        var confirm = AnsiConsole.Confirm("Stop tunnel and restore default network routing?", defaultValue: true);
         if (!confirm) return;
 
-        ProxyRestoreResult result = null!;
+        TunnelOperationResult result = null!;
         await AnsiConsole.Status()
             .Spinner(Spinner.Known.Dots)
-            .StartAsync("Restoring system proxy settings...", async _ =>
+            .StartAsync("Restoring system networking...", async _ =>
             {
-                result = await _proxyService.DisconnectAsync(force: false, ct);
+                result = await _proxyService.DisconnectAsync(ct);
             });
 
         if (result.Success)
@@ -157,19 +146,7 @@ public sealed class InteractiveMenu
         }
         else
         {
-            Theme.ShowWarning(result.Message);
-            if (AnsiConsole.Confirm("Force restore saved settings anyway?", defaultValue: false))
-            {
-                await AnsiConsole.Status()
-                    .Spinner(Spinner.Known.Dots)
-                    .StartAsync("Force-restoring settings...", async _ =>
-                    {
-                        result = await _proxyService.DisconnectAsync(force: true, ct);
-                    });
-
-                if (result.Success) Theme.ShowSuccess(result.Message);
-                else Theme.ShowError(result.Message);
-            }
+            Theme.ShowError(result.Message);
         }
     }
 
@@ -188,7 +165,6 @@ public sealed class InteractiveMenu
                 }));
 
         var profiles = await _proxyService.GetProfilesAsync(ct);
-        var active = await _proxyService.GetActiveProfileAsync(ct);
 
         switch (action)
         {
@@ -293,6 +269,9 @@ public sealed class InteractiveMenu
         var status = await _proxyService.GetStatusAsync(ct);
         StatusRenderer.RenderStatus(status);
 
+        AnsiConsole.WriteLine();
+        StatusRenderer.RenderProtocols(status.TunnelStatus.Protocols);
+
         var profiles = await _proxyService.GetProfilesAsync(ct);
         AnsiConsole.WriteLine();
         AnsiConsole.MarkupLine("[bold cyan]Configured Profiles:[/]");
@@ -348,20 +327,22 @@ public sealed class InteractiveMenu
 
     private async Task HandleDiagnosticsAsync(ProxyStatusInfo status, CancellationToken ct)
     {
-        AnsiConsole.MarkupLine("\n[bold cyan]─── System Diagnostics & Recovery ───[/]\n");
+        AnsiConsole.MarkupLine("\n[bold cyan]─── Network Diagnostics & Recovery ───[/]\n");
         AnsiConsole.MarkupLine($"Operating System: [white]{Environment.OSVersion}[/]");
-        AnsiConsole.MarkupLine($"Platform Adapter: [white]{status.PlatformName}[/] (Supported: {(status.PlatformSupported ? "[green]Yes[/]" : "[red]No[/]")})");
-        AnsiConsole.MarkupLine($"Recovery Status: {(status.HasPendingRecovery ? $"[bold red]ALERT: {status.RecoveryMessage}[/]" : "[green]Clean (No pending recovery)[/]")}");
-        AnsiConsole.MarkupLine($"Conflict Status: {(status.HasConflict ? $"[bold yellow]{status.ConflictMessage}[/]" : "[green]No external conflicts detected[/]")}");
+        AnsiConsole.MarkupLine($"Tunnel State:     [white]{status.TunnelStatus.State}[/]");
+        AnsiConsole.MarkupLine($"Upstream Status:  {(status.TunnelStatus.UpstreamReachable ? "[green]Reachable[/]" : "[yellow]Unreachable / Degraded[/]")}");
 
-        if (status.HasPendingRecovery || status.HasConflict)
+        if (status.HasPendingRecovery)
         {
-            if (AnsiConsole.Confirm("Attempt automatic recovery (reset system proxy state)?", defaultValue: true))
-            {
-                var res = await _proxyService.DisconnectAsync(force: true, ct);
-                if (res.Success) Theme.ShowSuccess("Recovery successful: System proxy settings restored.");
-                else Theme.ShowError($"Recovery failed: {res.Message}");
-            }
+            AnsiConsole.MarkupLine($"Recovery Alert:   [bold red]{status.RecoveryMessage}[/]");
+        }
+
+        if (AnsiConsole.Confirm("Attempt automatic cleanup (reset TUN interface, routing rules, and DNS)?", defaultValue: false))
+        {
+            var platform = new LinuxTunnelPlatform();
+            await platform.CleanStaleStateAsync(new TunnelAddressing(), ct);
+            await _proxyService.DisconnectAsync(ct);
+            Theme.ShowSuccess("Network cleanup complete. System routing restored.");
         }
     }
 
@@ -375,11 +356,12 @@ public sealed class InteractiveMenu
         table.AddColumn("[bold]Feature / Concept[/]");
         table.AddColumn("[bold]Description & Behavior[/]");
 
-        table.AddRow("Proxy Client Only", "ErgoProxy configures your operating system to route traffic through an existing HTTP/HTTPS proxy. It does not run a local proxy server or VPN tunnel.");
-        table.AddRow("Safe Restoration", "When disconnecting, ErgoProxy restores your exact previous OS proxy settings instead of blindly erasing them.");
-        table.AddRow("Credential Security", "Credentials are encrypted at rest using OS keyrings or an AES-256-GCM vault, and never appear in plain text in logs or configuration files.");
-        table.AddRow("Platform Support", "Supports GNOME and KDE Plasma on Linux, WinINet on Windows, and networksetup on macOS.");
-        table.AddRow("CLI Mode", "Run 'ergoproxy --help' or 'ergoproxy <command>' to execute operations non-interactively in scripts or CI/CD pipelines.");
+        table.AddRow("Device-Wide Tunnel", "ErgoProxy creates a local TUN interface and configures OS policy routing so application network traffic is captured system-wide without configuring individual apps.");
+        table.AddRow("Upstream HTTP Proxy", "Captured TCP flows are transported through your campus or remote HTTP proxy using standard HTTP CONNECT tunnels.");
+        table.AddRow("Zero TLS Interception", "Application TLS sessions remain encrypted end-to-end between your device and the destination. No custom root CA certificates or payload inspection.");
+        table.AddRow("Fake-IP DNS Engine", "Virtual DNS resolver intercepts domain lookups and returns fake IPs, delegating destination resolution entirely to the upstream proxy to bypass campus DNS censorship.");
+        table.AddRow("Reversible Networking", "Disconnecting removes policy routing rules, table routes, and restores DNS so your network state returns cleanly to default.");
+        table.AddRow("Credential Vault", "Proxy credentials are stored securely in the OS keyring or an encrypted AES vault, and never appear in plaintext logs or diagnostics.");
 
         AnsiConsole.Write(table);
     }

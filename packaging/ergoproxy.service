@@ -1,0 +1,16 @@
+[Unit]
+Description=ErgoProxy Device-Wide HTTP Tunnel Daemon
+Documentation=https://github.com/ergoproxy/ergoproxy
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ergoproxy daemon
+Restart=on-failure
+RestartSec=5s
+KillMode=process
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

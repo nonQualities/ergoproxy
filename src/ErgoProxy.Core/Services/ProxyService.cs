@@ -1,7 +1,7 @@
 using ErgoProxy.Core.Credentials;
+using ErgoProxy.Core.Daemon;
 using ErgoProxy.Core.Models;
 using ErgoProxy.Core.Network;
-using ErgoProxy.Core.Platform;
 using ErgoProxy.Core.Storage;
 using ErgoProxy.Core.Validation;
 
@@ -13,7 +13,7 @@ public sealed class ProxyService : IProxyService
     private readonly IStateManager _stateManager;
     private readonly ICredentialStore _credentialStore;
     private readonly IProxyTester _proxyTester;
-    private readonly IPlatformAdapter _platformAdapter;
+    private readonly DaemonClient _daemonClient;
     private readonly IProfileValidator _validator;
 
     public ProxyService(
@@ -21,14 +21,14 @@ public sealed class ProxyService : IProxyService
         IStateManager stateManager,
         ICredentialStore credentialStore,
         IProxyTester proxyTester,
-        IPlatformAdapter platformAdapter,
+        DaemonClient? daemonClient = null,
         IProfileValidator? validator = null)
     {
         _profileRepo = profileRepo;
         _stateManager = stateManager;
         _credentialStore = credentialStore;
         _proxyTester = proxyTester;
-        _platformAdapter = platformAdapter;
+        _daemonClient = daemonClient ?? new DaemonClient();
         _validator = validator ?? new ProfileValidator();
     }
 
@@ -46,13 +46,20 @@ public sealed class ProxyService : IProxyService
     {
         ArgumentNullException.ThrowIfNull(profile);
 
+        if (profile.AuthenticationEnabled && string.IsNullOrWhiteSpace(profile.CredentialReference))
+        {
+            profile.CredentialReference = $"ref_{profile.Id}";
+        }
+
+        var validation = _validator.Validate(profile);
+        if (!validation.IsValid)
+        {
+            throw new ArgumentException($"Cannot save invalid profile: {string.Join("; ", validation.Errors)}");
+        }
+
         if (profile.AuthenticationEnabled && credentials != null)
         {
-            if (string.IsNullOrWhiteSpace(profile.CredentialReference))
-            {
-                profile.CredentialReference = $"ref_{profile.Id}";
-            }
-            await _credentialStore.SaveCredentialsAsync(profile.CredentialReference, credentials, ct).ConfigureAwait(false);
+            await _credentialStore.SaveCredentialsAsync(profile.CredentialReference!, credentials, ct).ConfigureAwait(false);
         }
 
         await _profileRepo.SaveAsync(profile, ct).ConfigureAwait(false);
@@ -136,7 +143,7 @@ public sealed class ProxyService : IProxyService
         return result;
     }
 
-    public async Task<ProxyApplyResult> ConnectAsync(string? profileId = null, bool force = false, CancellationToken ct = default)
+    public async Task<TunnelOperationResult> ConnectAsync(string? profileId = null, CancellationToken ct = default)
     {
         ProxyProfile? profile;
         if (!string.IsNullOrWhiteSpace(profileId))
@@ -150,138 +157,76 @@ public sealed class ProxyService : IProxyService
 
         if (profile == null)
         {
-            return ProxyApplyResult.Failed("No proxy profile selected for activation.");
+            return new TunnelOperationResult(false, "No proxy profile selected for activation.");
         }
 
         var validation = _validator.Validate(profile);
         if (!validation.IsValid)
         {
-            return ProxyApplyResult.Failed($"Cannot activate invalid profile: {string.Join("; ", validation.Errors)}");
+            return new TunnelOperationResult(false, $"Cannot activate invalid profile: {string.Join("; ", validation.Errors)}");
         }
 
-        if (!_platformAdapter.IsSupported)
+        ProxyCredentials? creds = null;
+        if (profile.AuthenticationEnabled && !string.IsNullOrWhiteSpace(profile.CredentialReference))
         {
-            return ProxyApplyResult.Failed(_platformAdapter.UnsupportedReason ?? "Platform does not support system proxy changes.");
+            creds = await _credentialStore.GetCredentialsAsync(profile.CredentialReference, ct).ConfigureAwait(false);
         }
 
-        var state = await _stateManager.GetStateAsync(ct).ConfigureAwait(false);
-        var currentOs = await _platformAdapter.GetCurrentSettingsAsync(ct).ConfigureAwait(false);
-
-        // Conflict check (FR-12): if system proxy is already enabled and not managed by us
-        if (currentOs.Enabled && !state.IsSystemProxyApplied && !force)
+        // Ensure background helper daemon is active
+        var (daemonReady, daemonMsg) = await DaemonLauncher.EnsureRunningAsync(_daemonClient, ct).ConfigureAwait(false);
+        if (!daemonReady)
         {
-            return ProxyApplyResult.Conflict(
-                $"System proxy is already active externally ({currentOs.HttpHost}:{currentOs.HttpPort}). Use --force to overwrite.");
+            return new TunnelOperationResult(false, $"Tunnel service unavailable: {daemonMsg}");
         }
 
-        // Snapshot previous configuration before applying if not already saved
-        if (state.RestorableConfiguration == null || !state.IsSystemProxyApplied)
+        var startReq = new TunnelStartRequest
         {
-            state.RestorableConfiguration = currentOs;
-        }
+            ProfileName = profile.Name,
+            ProxyHost = profile.Host,
+            ProxyPort = profile.Port,
+            Username = creds?.Username,
+            Password = creds?.Password,
+            BypassRules = profile.BypassRules
+        };
 
-        var applyResult = await _platformAdapter.ApplyAsync(profile, ct).ConfigureAwait(false);
-        if (!applyResult.Success)
+        var startRes = await _daemonClient.StartAsync(startReq, ct).ConfigureAwait(false);
+        if (startRes.Success)
         {
-            // Do not leave profile marked active when activation failed (FR-11)
-            state.HasPendingRecovery = true;
-            state.RecoveryMessage = $"Activation failed for profile '{profile.Name}': {applyResult.Message}";
-            await _stateManager.SaveStateAsync(state, ct).ConfigureAwait(false);
-            return applyResult;
-        }
-
-        state.IsSystemProxyApplied = true;
-        state.ActiveProfileId = profile.Id;
-        state.AppliedEndpoint = $"{profile.Host}:{profile.Port}";
-        state.HasPendingRecovery = false;
-        state.RecoveryMessage = null;
-        await _stateManager.SaveStateAsync(state, ct).ConfigureAwait(false);
-
-        return applyResult;
-    }
-
-    public async Task<ProxyRestoreResult> DisconnectAsync(bool force = false, CancellationToken ct = default)
-    {
-        if (!_platformAdapter.IsSupported)
-        {
-            return ProxyRestoreResult.Failed(_platformAdapter.UnsupportedReason ?? "Platform unsupported.");
-        }
-
-        var state = await _stateManager.GetStateAsync(ct).ConfigureAwait(false);
-        var currentOs = await _platformAdapter.GetCurrentSettingsAsync(ct).ConfigureAwait(false);
-
-        // Check if settings were modified externally since applied (FR-12)
-        if (state.IsSystemProxyApplied && !string.IsNullOrWhiteSpace(state.AppliedEndpoint))
-        {
-            var parts = state.AppliedEndpoint.Split(':');
-            var appliedHost = parts[0];
-            int.TryParse(parts.Length > 1 ? parts[1] : "0", out var appliedPort);
-
-            if (!currentOs.IsEquivalentTo(appliedHost, appliedPort) && !force)
-            {
-                return ProxyRestoreResult.Failed(
-                    "System proxy was modified externally since ErgoProxy applied it. Use --force to restore saved configuration.");
-            }
-        }
-
-        var restorable = state.RestorableConfiguration ?? new SystemProxyConfiguration { Enabled = false };
-        var restoreResult = await _platformAdapter.RestoreAsync(restorable, ct).ConfigureAwait(false);
-
-        if (restoreResult.Success)
-        {
-            state.IsSystemProxyApplied = false;
-            state.AppliedEndpoint = null;
-            state.RestorableConfiguration = null;
+            var state = await _stateManager.GetStateAsync(ct).ConfigureAwait(false);
+            state.ActiveProfileId = profile.Id;
             state.HasPendingRecovery = false;
             state.RecoveryMessage = null;
             await _stateManager.SaveStateAsync(state, ct).ConfigureAwait(false);
         }
-        else
+
+        return new TunnelOperationResult(startRes.Success, startRes.Message, startRes.Status);
+    }
+
+    public async Task<TunnelOperationResult> DisconnectAsync(CancellationToken ct = default)
+    {
+        var stopRes = await _daemonClient.StopAsync(ct).ConfigureAwait(false);
+        if (stopRes.Success)
         {
-            state.HasPendingRecovery = true;
-            state.RecoveryMessage = $"Failed to restore previous proxy settings: {restoreResult.Message}";
+            var state = await _stateManager.GetStateAsync(ct).ConfigureAwait(false);
+            state.HasPendingRecovery = false;
+            state.RecoveryMessage = null;
             await _stateManager.SaveStateAsync(state, ct).ConfigureAwait(false);
         }
 
-        return restoreResult;
+        return new TunnelOperationResult(stopRes.Success, stopRes.Message, stopRes.Status);
     }
 
     public async Task<ProxyStatusInfo> GetStatusAsync(CancellationToken ct = default)
     {
         var state = await _stateManager.GetStateAsync(ct).ConfigureAwait(false);
         var activeProfile = await GetActiveProfileAsync(ct).ConfigureAwait(false);
-        var currentOs = await _platformAdapter.GetCurrentSettingsAsync(ct).ConfigureAwait(false);
-
-        var configuredEndpoint = activeProfile != null ? $"{activeProfile.Host}:{activeProfile.Port}" : null;
-        var isActuallyActive = currentOs.Enabled;
-
-        var hasConflict = false;
-        string? conflictMessage = null;
-
-        if (state.IsSystemProxyApplied && state.AppliedEndpoint != null)
-        {
-            var parts = state.AppliedEndpoint.Split(':');
-            var expectedHost = parts[0];
-            int.TryParse(parts.Length > 1 ? parts[1] : "0", out var expectedPort);
-
-            if (!currentOs.IsEquivalentTo(expectedHost, expectedPort))
-            {
-                hasConflict = true;
-                conflictMessage = $"System settings mismatch: ErgoProxy applied '{state.AppliedEndpoint}', but OS reports '{currentOs.HttpHost}:{currentOs.HttpPort}'.";
-            }
-        }
+        var tunnelStatus = await _daemonClient.GetStatusAsync(ct).ConfigureAwait(false) ?? TunnelStatus.NotRunning();
 
         return new ProxyStatusInfo(
             ActiveProfile: activeProfile,
-            ConfiguredEndpoint: configuredEndpoint,
-            IsSystemProxyApplied: state.IsSystemProxyApplied,
-            IsSystemProxyActuallyActive: isActuallyActive,
+            TunnelStatus: tunnelStatus,
             LastTestResult: state.LastTestResult,
             LastTestedAt: state.LastTestedAt,
-            PlatformName: _platformAdapter.DesktopEnvironment,
-            PlatformSupported: _platformAdapter.IsSupported,
-            HasConflict: hasConflict,
-            ConflictMessage: conflictMessage,
             HasPendingRecovery: state.HasPendingRecovery,
             RecoveryMessage: state.RecoveryMessage);
     }

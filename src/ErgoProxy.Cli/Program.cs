@@ -1,10 +1,13 @@
 using ErgoProxy.Cli.Commands;
 using ErgoProxy.Cli.UI;
 using ErgoProxy.Core.Credentials;
+using ErgoProxy.Core.Daemon;
 using ErgoProxy.Core.Network;
-using ErgoProxy.Core.Platform;
 using ErgoProxy.Core.Services;
 using ErgoProxy.Core.Storage;
+using ErgoProxy.Core.Tunnel;
+using ErgoProxy.Core.Tunnel.Native;
+using ErgoProxy.Core.Tunnel.Platform;
 using ErgoProxy.Core.Validation;
 
 namespace ErgoProxy.Cli;
@@ -21,14 +24,14 @@ public static class Program
         var credentialStore = CredentialStoreFactory.CreateDefault(configDir);
         var validator = new ProfileValidator();
         var proxyTester = new ProxyTester(validator);
-        var platformAdapter = PlatformAdapterFactory.CreateDefault();
+        var daemonClient = new DaemonClient();
 
         var proxyService = new ProxyService(
             profileRepo,
             stateManager,
             credentialStore,
             proxyTester,
-            platformAdapter,
+            daemonClient,
             validator);
 
         // If no arguments or explicitly requesting interactive mode, launch TUI
@@ -44,6 +47,8 @@ public static class Program
 
         return command switch
         {
+            "daemon" => await RunDaemonAsync(cmdArgs),
+            "recover" or "reset" => await RunRecoverAsync(stateManager),
             "configure" => await ConfigureCommand.ExecuteAsync(proxyService, cmdArgs),
             "profiles" or "list" => await ProfilesCommand.ExecuteAsync(proxyService, cmdArgs),
             "test" => await TestCommand.ExecuteAsync(proxyService, cmdArgs),
@@ -53,6 +58,48 @@ public static class Program
             "help" or "--help" or "-h" => ShowHelpAndReturnZero(),
             _ => ShowUnknownCommand(command)
         };
+    }
+
+    private static async Task<int> RunDaemonAsync(string[] args)
+    {
+        string? socketPath = null;
+        uint? targetUid = null;
+        var detach = false;
+
+        for (var i = 0; i < args.Length; i++)
+        {
+            var a = args[i];
+            if (a == "--socket" && i + 1 < args.Length) socketPath = args[++i];
+            else if (a == "--uid" && i + 1 < args.Length && uint.TryParse(args[++i], out var u)) targetUid = u;
+            else if (a == "--detach") detach = true;
+        }
+
+        if (detach && OperatingSystem.IsLinux())
+        {
+            LinuxNative.SetSid();
+            LinuxNative.DetachStdio();
+        }
+
+        var controller = new TunnelController();
+        await using var server = new DaemonServer(controller, socketPath, targetUid);
+        await server.StartAsync();
+        await server.WaitForShutdownAsync();
+        return 0;
+    }
+
+    private static async Task<int> RunRecoverAsync(IStateManager stateManager)
+    {
+        Console.WriteLine("Cleaning stale routing rules, TUN interfaces, and DNS configuration...");
+        var platform = new LinuxTunnelPlatform();
+        await platform.CleanStaleStateAsync(new TunnelAddressing());
+
+        var state = await stateManager.GetStateAsync();
+        state.HasPendingRecovery = false;
+        state.RecoveryMessage = null;
+        await stateManager.SaveStateAsync(state);
+
+        Console.WriteLine("Recovery complete. Sane networking state restored.");
+        return 0;
     }
 
     private static int ShowHelpAndReturnZero()

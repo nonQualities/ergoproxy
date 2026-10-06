@@ -17,7 +17,7 @@ public static class StatusRenderer
         {
             grid.AddRow("[bold]Selected Profile:[/]", $"[cyan]{Markup.Escape(status.ActiveProfile.Name)}[/] [dim]({status.ActiveProfile.Id})[/]");
             grid.AddRow("[bold]Proxy Endpoint:[/]", $"[white]{status.ActiveProfile.Host}:{status.ActiveProfile.Port}[/]");
-            grid.AddRow("[bold]Authentication:[/]", status.ActiveProfile.AuthenticationEnabled ? "[green]Enabled (OS Vault)[/]" : "[grey]Disabled[/]");
+            grid.AddRow("[bold]Authentication:[/]", status.ActiveProfile.AuthenticationEnabled ? "[green]Enabled (OS Keyring / Vault)[/]" : "[grey]Disabled[/]");
             grid.AddRow("[bold]Bypass Rules:[/]", status.ActiveProfile.BypassRules.Count > 0 ? string.Join(", ", status.ActiveProfile.BypassRules) : "[grey]None[/]");
         }
         else
@@ -25,20 +25,44 @@ public static class StatusRenderer
             grid.AddRow("[bold]Selected Profile:[/]", "[dim yellow]None selected[/]");
         }
 
-        // Platform integration
-        var platformStatus = status.PlatformSupported ? $"[green]{status.PlatformName}[/]" : $"[red]{status.PlatformName} (Unsupported)[/]";
-        grid.AddRow("[bold]Platform Adapter:[/]", platformStatus);
+        // Tunnel state badge
+        var t = status.TunnelStatus;
+        var stateColor = t.State switch
+        {
+            TunnelState.Connected => "bold green",
+            TunnelState.Degraded => "bold yellow",
+            TunnelState.Connecting or TunnelState.Validating => "bold cyan",
+            TunnelState.Disconnecting => "bold yellow",
+            TunnelState.Error => "bold red",
+            _ => "dim grey"
+        };
+        var stateBadge = $"[{stateColor}]{t.State.ToString().ToUpperInvariant()}[/]";
+        grid.AddRow("[bold]Tunnel State:[/]", stateBadge);
 
-        // System proxy status
-        var managedStatus = status.IsSystemProxyApplied
-            ? "[bold green]Applied by ErgoProxy[/]"
-            : "[dim grey]Not applied[/]";
-        grid.AddRow("[bold]Managed Proxy:[/]", managedStatus);
+        if (t.IsActive)
+        {
+            grid.AddRow("[bold]Tunnel Interface:[/]", $"[white]{t.InterfaceName ?? "ergo0"}[/] [dim]({t.DnsMode})[/]");
+            var upstreamBadge = t.UpstreamReachable
+                ? $"[green]Reachable[/] [dim]({t.LastProbeLatencyMs:F1}ms)[/]"
+                : $"[red]Unreachable[/] [dim]({Markup.Escape(t.LastProbeMessage ?? "failed")})[/]";
+            grid.AddRow("[bold]Upstream Proxy:[/]", upstreamBadge);
 
-        var osStatus = status.IsSystemProxyActuallyActive
-            ? "[bold green]Active in OS Settings[/]"
-            : "[dim grey]Disabled in OS Settings[/]";
-        grid.AddRow("[bold]OS Proxy State:[/]", osStatus);
+            // Traffic statistics
+            var stats = t.Stats;
+            var rxStr = FormatBytes(stats.BytesDown);
+            var txStr = FormatBytes(stats.BytesUp);
+            grid.AddRow("[bold]Flows / Active:[/]", $"[white]{stats.TotalConnections}[/] total, [cyan]{stats.ActiveConnections}[/] active [dim]({stats.FailedConnections} failed)[/]");
+            grid.AddRow("[bold]Traffic (RX / TX):[/]", $"[green]↓ {rxStr}[/] / [blue]↑ {txStr}[/]");
+            grid.AddRow("[bold]DNS Queries:[/]", $"[white]{stats.DnsQueries}[/] [dim](Fake-IP)[/]");
+            if (stats.UdpRejected > 0 || stats.Ipv6Rejected > 0)
+            {
+                grid.AddRow("[bold]Rejected Traffic:[/]", $"[yellow]{stats.UdpRejected}[/] UDP, [yellow]{stats.Ipv6Rejected}[/] IPv6 [dim](TCP fallback enforced)[/]");
+            }
+        }
+        else
+        {
+            grid.AddRow("[bold]Tunnel Message:[/]", $"[dim]{Markup.Escape(t.Message)}[/]");
+        }
 
         // Last test result
         if (status.LastTestResult != null)
@@ -47,47 +71,62 @@ public static class StatusRenderer
                 ? $"[green]Verified ({status.LastTestResult.LatencyMilliseconds:F1}ms)[/]"
                 : $"[red]Failed ({status.LastTestResult.Stage} / {status.LastTestResult.ErrorCode})[/]";
             var testTime = status.LastTestedAt?.ToLocalTime().ToString("g") ?? "Recently";
-            grid.AddRow("[bold]Connectivity:[/]", $"{testBadge} [dim]at {testTime}[/]");
+            grid.AddRow("[bold]Last Diagnostics:[/]", $"{testBadge} [dim]at {testTime}[/]");
             if (!status.LastTestResult.IsSuccess)
             {
-                grid.AddRow("[bold]Error Detail:[/]", $"[red]{Markup.Escape(status.LastTestResult.Message)}[/]");
+                grid.AddRow("[bold]Diagnostic Error:[/]", $"[red]{Markup.Escape(status.LastTestResult.Message)}[/]");
             }
-        }
-        else
-        {
-            grid.AddRow("[bold]Connectivity:[/]", "[grey]Not tested yet[/]");
         }
 
         var panel = new Panel(grid)
         {
-            Header = new PanelHeader("[bold cyan] Connection Status [/]"),
+            Header = new PanelHeader("[bold cyan] Device-Wide Tunnel Dashboard [/]"),
             Border = BoxBorder.Rounded,
             Padding = new Padding(2, 1, 2, 1)
         };
 
         AnsiConsole.Write(panel);
 
-        if (status.HasConflict)
-        {
-            AnsiConsole.WriteLine();
-            var conflictPanel = new Panel(new Markup($"[bold red]WARNING:[/] {Markup.Escape(status.ConflictMessage ?? "External conflict detected.")}"))
-            {
-                Border = BoxBorder.Heavy,
-                BorderStyle = new Style(Color.Yellow)
-            };
-            AnsiConsole.Write(conflictPanel);
-        }
-
         if (status.HasPendingRecovery)
         {
             AnsiConsole.WriteLine();
-            var recoveryPanel = new Panel(new Markup($"[bold red]RECOVERY ALERT:[/] {Markup.Escape(status.RecoveryMessage ?? "Pending recovery state detected.")}\n[dim]Run 'disconnect' or restore OS proxy manually if necessary.[/]"))
+            var recoveryPanel = new Panel(new Markup($"[bold red]RECOVERY ALERT:[/] {Markup.Escape(status.RecoveryMessage ?? "Pending recovery state detected.")}\n[dim]Run 'ergoproxy recover' or 'ergoproxy disconnect' to restore default network routing.[/]"))
             {
                 Border = BoxBorder.Heavy,
                 BorderStyle = new Style(Color.Red)
             };
             AnsiConsole.Write(recoveryPanel);
         }
+    }
+
+    public static void RenderProtocols(List<ProtocolSupport> protocols)
+    {
+        var table = new Table();
+        table.Border = TableBorder.Rounded;
+        table.AddColumn("[bold]Protocol / Traffic[/]");
+        table.AddColumn("[bold]Support Level[/]");
+        table.AddColumn("[bold]Behavior & Rationale[/]");
+
+        foreach (var p in protocols)
+        {
+            var levelBadge = p.Level switch
+            {
+                SupportLevel.Supported => "[bold green]Supported[/]",
+                SupportLevel.Partial => "[bold yellow]Partial[/]",
+                SupportLevel.Blocked => "[bold red]Blocked (ICMP Reject)[/]",
+                _ => "[dim grey]Unsupported[/]"
+            };
+
+            table.AddRow($"[white]{p.Name}[/]", levelBadge, $"[dim]{Markup.Escape(p.Note)}[/]");
+        }
+
+        var panel = new Panel(table)
+        {
+            Header = new PanelHeader("[bold cyan] Protocol Transparency Matrix (Property 8) [/]"),
+            Border = BoxBorder.Rounded
+        };
+
+        AnsiConsole.Write(panel);
     }
 
     public static void RenderTestResult(ProxyTestResult result)
@@ -115,7 +154,7 @@ public static class StatusRenderer
 
         var panel = new Panel(table)
         {
-            Header = new PanelHeader($"[bold cyan] Connectivity Test Report [/]"),
+            Header = new PanelHeader("[bold cyan] Connectivity Test Report [/]"),
             Border = BoxBorder.Rounded
         };
 
@@ -159,5 +198,13 @@ public static class StatusRenderer
         }
 
         AnsiConsole.Write(table);
+    }
+
+    private static string FormatBytes(long bytes)
+    {
+        if (bytes < 1024) return $"{bytes} B";
+        if (bytes < 1024 * 1024) return $"{bytes / 1024.0:F1} KB";
+        if (bytes < 1024 * 1024 * 1024) return $"{bytes / (1024.0 * 1024.0):F1} MB";
+        return $"{bytes / (1024.0 * 1024.0 * 1024.0):F2} GB";
     }
 }
