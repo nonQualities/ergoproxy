@@ -1,0 +1,26 @@
+# .NET build artifacts
+bin/
+obj/
+out/
+
+# .NET CLI home & NuGet packages local cache
+.dotnet/
+.nuget/
+
+# User data & credentials
+*.credentials
+*.key
+*.vault
+.ergoproxy/
+
+# IDE files
+.vscode/
+.idea/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# OS files
+.DS_Store
+Thumbs.db

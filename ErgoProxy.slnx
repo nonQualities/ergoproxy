@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/ErgoProxy.Cli/ErgoProxy.Cli.csproj" />
+    <Project Path="src/ErgoProxy.Core/ErgoProxy.Core.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/ErgoProxy.Tests/ErgoProxy.Tests.csproj" />
+  </Folder>
+</Solution>
