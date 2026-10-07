@@ -10,10 +10,7 @@ public sealed class DaemonClient
     public const string DefaultSocketPath = "/run/ergoproxy/control.sock";
     private readonly string _socketPath;
 
-    public DaemonClient(string? socketPath = null)
-    {
-        _socketPath = socketPath ?? DefaultSocketPath;
-    }
+    public DaemonClient(string? socketPath = null) => _socketPath = socketPath ?? DefaultSocketPath;
 
     public async Task<bool> IsRunningAsync(CancellationToken ct = default)
     {
@@ -35,13 +32,9 @@ public sealed class DaemonClient
         return response?.Status;
     }
 
-    public async Task<ControlResponse> StartAsync(TunnelStartRequest startRequest, CancellationToken ct = default)
-    {
-        var response = await SendCommandAsync(new ControlRequest
-        {
-            Command = "start",
-            StartRequest = startRequest
-        }, ct).ConfigureAwait(false);
+    public async Task<ControlResponse> StartAsync(TunnelStartRequest
+    startRequest, CancellationToken ct = default) { var response = await
+    SendCommandAsync(new ControlRequest { Command = "start", StartRequest = startRequest }, ct).ConfigureAwait(false);
 
         return response ?? ControlResponse.Fail("No response received from daemon.");
     }

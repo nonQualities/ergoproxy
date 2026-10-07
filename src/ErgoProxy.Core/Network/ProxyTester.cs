@@ -46,7 +46,7 @@ public sealed class ProxyTester : IProxyTester
                 ProxyTestErrorCode.InvalidConfig,
                 "Authentication is enabled for this profile, but no credentials were provided.",
                 latencyMs: 0);
-        }
+            }
 
         using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         timeoutCts.CancelAfter(options.Timeout);
