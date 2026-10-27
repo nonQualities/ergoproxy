@@ -15,9 +15,9 @@ public static class DaemonLauncher
             return (true, "Daemon is already running.");
         }
 
-        if (!LinuxNative.IsLinux)
+        if (!OperatingSystem.IsLinux() && !OperatingSystem.IsWindows())
         {
-            return (false, "Device-wide network tunnelling is only supported on Linux in Phase 1.");
+            return (false, "Device-wide network tunnelling is only supported on Linux and Windows.");
         }
 
         var processPath = Environment.ProcessPath;
@@ -26,38 +26,72 @@ public static class DaemonLauncher
             return (false, "Unable to determine application executable path.");
         }
 
-        var uid = LinuxNative.GetUid();
-
-        // If we are already root, spawn detached daemon directly
-        if (LinuxNative.IsRoot)
+        if (OperatingSystem.IsWindows())
         {
-            StartDetachedProcess(processPath, ["daemon", "--detach", "--uid", uid.ToString()]);
-        }
-        else
-        {
-            // Prompt for sudo credentials interactively if needed
-            var sudoCheck = await ProcessRunner.RunAsync("sudo", ["-n", "true"], TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
-            if (sudoCheck.ExitCode != 0)
+            if (IsWindowsAdministrator())
             {
-                // Run sudo -v with console attached
-                var sudoValidate = Process.Start(new ProcessStartInfo("sudo", "-v") { UseShellExecute = false });
-                if (sudoValidate != null)
+                StartDetachedProcess(processPath, ["daemon", "--detach"]);
+            }
+            else
+            {
+                // Trigger UAC prompt for elevation
+                var psi = new ProcessStartInfo(processPath)
                 {
-                    await sudoValidate.WaitForExitAsync(ct).ConfigureAwait(false);
-                    if (sudoValidate.ExitCode != 0)
+                    UseShellExecute = true,
+                    Verb = "runas",
+                    WindowStyle = ProcessWindowStyle.Hidden
+                };
+                psi.ArgumentList.Add("daemon");
+                psi.ArgumentList.Add("--detach");
+
+                try
+                {
+                    var proc = Process.Start(psi);
+                    if (proc == null)
                     {
-                        return (false, "Root privileges (sudo) are required to establish a device-wide network tunnel.");
+                        return (false, "Failed to launch elevated ErgoProxy daemon.");
                     }
                 }
+                catch (Exception ex)
+                {
+                    return (false, $"Administrator privileges are required to configure network routes and Wintun: {ex.Message}");
+                }
             }
+        }
+        else if (OperatingSystem.IsLinux())
+        {
+            var uid = LinuxNative.GetUid();
 
-            // Launch detached daemon using sudo
-            StartDetachedProcess("sudo", [processPath, "daemon", "--detach", "--uid", uid.ToString()]);
+            // If we are already root, spawn detached daemon directly
+            if (LinuxNative.IsRoot)
+            {
+                StartDetachedProcess(processPath, ["daemon", "--detach", "--uid", uid.ToString()]);
+            }
+            else
+            {
+                // Prompt for sudo credentials interactively if needed
+                var sudoCheck = await ProcessRunner.RunAsync("sudo", ["-n", "true"], TimeSpan.FromSeconds(2), ct).ConfigureAwait(false);
+                if (sudoCheck.ExitCode != 0)
+                {
+                    var sudoValidate = Process.Start(new ProcessStartInfo("sudo", "-v") { UseShellExecute = false });
+                    if (sudoValidate != null)
+                    {
+                        await sudoValidate.WaitForExitAsync(ct).ConfigureAwait(false);
+                        if (sudoValidate.ExitCode != 0)
+                        {
+                            return (false, "Root privileges (sudo) are required to establish a device-wide network tunnel.");
+                        }
+                    }
+                }
+
+                // Launch detached daemon using sudo
+                StartDetachedProcess("sudo", [processPath, "daemon", "--detach", "--uid", uid.ToString()]);
+            }
         }
 
-        // Wait for socket to become available and responding
+        // Wait for daemon to become available and responding
         var sw = Stopwatch.StartNew();
-        while (sw.Elapsed < TimeSpan.FromSeconds(6))
+        while (sw.Elapsed < TimeSpan.FromSeconds(8))
         {
             if (await client.IsRunningAsync(ct).ConfigureAwait(false))
             {
@@ -67,6 +101,21 @@ public static class DaemonLauncher
         }
 
         return (false, "Timed out waiting for ErgoProxy background daemon to start.");
+    }
+
+    private static bool IsWindowsAdministrator()
+    {
+        if (!OperatingSystem.IsWindows()) return false;
+        try
+        {
+            using var id = System.Security.Principal.WindowsIdentity.GetCurrent();
+            var principal = new System.Security.Principal.WindowsPrincipal(id);
+            return principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private static void StartDetachedProcess(string fileName, string[] args)
@@ -88,7 +137,6 @@ public static class DaemonLauncher
         var proc = Process.Start(psi);
         if (proc != null)
         {
-            // Allow child process to run detached
             proc.StandardInput.Close();
         }
     }

@@ -1,3 +1,4 @@
+using System.IO.Pipes;
 using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
@@ -10,43 +11,50 @@ namespace ErgoProxy.Core.Daemon;
 public sealed class DaemonServer : IAsyncDisposable
 {
     private readonly TunnelController _controller;
-    private readonly string _socketPath;
+    private readonly string _endpoint;
     private readonly uint? _targetUid;
     private Socket? _listener;
     private readonly CancellationTokenSource _cts = new();
     private Task? _acceptTask;
 
-    public DaemonServer(TunnelController controller, string? socketPath = null, uint? targetUid = null)
+    public DaemonServer(TunnelController controller, string? endpoint = null, uint? targetUid = null)
     {
         _controller = controller;
-        _socketPath = socketPath ?? DaemonClient.DefaultSocketPath;
+        _endpoint = endpoint ?? DaemonClient.DefaultEndpoint;
         _targetUid = targetUid ?? GetSudoUid();
     }
 
     public async Task StartAsync()
     {
-        var dir = Path.GetDirectoryName(_socketPath);
-        if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+        if (OperatingSystem.IsWindows())
         {
-            Directory.CreateDirectory(dir);
+            _acceptTask = Task.Run(NamedPipeAcceptLoopAsync);
         }
-
-        if (File.Exists(_socketPath))
+        else
         {
-            try { File.Delete(_socketPath); } catch { }
+            var dir = Path.GetDirectoryName(_endpoint);
+            if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+
+            if (File.Exists(_endpoint))
+            {
+                try { File.Delete(_endpoint); } catch { }
+            }
+
+            _listener = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+            _listener.Bind(new UnixDomainSocketEndPoint(_endpoint));
+            _listener.Listen(16);
+
+            // Adjust ownership / permissions so the invoking user can access the socket
+            if (OperatingSystem.IsLinux() && _targetUid.HasValue)
+            {
+                LinuxNative.Chown(_endpoint, _targetUid.Value, _targetUid.Value);
+            }
+
+            _acceptTask = Task.Run(UnixSocketAcceptLoopAsync);
         }
-
-        _listener = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-        _listener.Bind(new UnixDomainSocketEndPoint(_socketPath));
-        _listener.Listen(16);
-
-        // Adjust ownership / permissions so the invoking user can access the socket
-        if (OperatingSystem.IsLinux() && _targetUid.HasValue)
-        {
-            LinuxNative.Chown(_socketPath, _targetUid.Value, _targetUid.Value);
-        }
-
-        _acceptTask = Task.Run(AcceptLoopAsync);
 
         // Register process exit hook for clean reversibility
         AppDomain.CurrentDomain.ProcessExit += OnProcessExit;
@@ -67,14 +75,15 @@ public sealed class DaemonServer : IAsyncDisposable
         CleanupSocketFile();
     }
 
-    private async Task AcceptLoopAsync()
+    private async Task UnixSocketAcceptLoopAsync()
     {
         while (!_cts.Token.IsCancellationRequested)
         {
             try
             {
                 var client = await _listener!.AcceptAsync(_cts.Token).ConfigureAwait(false);
-                _ = HandleClientAsync(client, _cts.Token);
+                var stream = new NetworkStream(client, ownsSocket: true);
+                _ = HandleClientStreamAsync(stream, _cts.Token);
             }
             catch (OperationCanceledException)
             {
@@ -91,10 +100,36 @@ public sealed class DaemonServer : IAsyncDisposable
         }
     }
 
-    private async Task HandleClientAsync(Socket client, CancellationToken ct)
+    private async Task NamedPipeAcceptLoopAsync()
     {
-        using (client)
-        using (var stream = new NetworkStream(client, ownsSocket: false))
+        while (!_cts.Token.IsCancellationRequested)
+        {
+            try
+            {
+                var serverStream = new NamedPipeServerStream(
+                    _endpoint,
+                    PipeDirection.InOut,
+                    NamedPipeServerStream.MaxAllowedServerInstances,
+                    PipeTransmissionMode.Byte,
+                    PipeOptions.Asynchronous);
+
+                await serverStream.WaitForConnectionAsync(_cts.Token).ConfigureAwait(false);
+                _ = HandleClientStreamAsync(serverStream, _cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception)
+            {
+                await Task.Delay(50, _cts.Token).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private async Task HandleClientStreamAsync(Stream stream, CancellationToken ct)
+    {
+        using (stream)
         using (var reader = new StreamReader(stream, Encoding.UTF8, leaveOpen: true))
         using (var writer = new StreamWriter(stream, Encoding.UTF8, leaveOpen: true))
         {
@@ -183,9 +218,9 @@ public sealed class DaemonServer : IAsyncDisposable
 
     private void CleanupSocketFile()
     {
-        if (File.Exists(_socketPath))
+        if (!OperatingSystem.IsWindows() && File.Exists(_endpoint))
         {
-            try { File.Delete(_socketPath); } catch { }
+            try { File.Delete(_endpoint); } catch { }
         }
     }
 

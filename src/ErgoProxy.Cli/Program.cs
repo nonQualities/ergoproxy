@@ -17,7 +17,9 @@ public static class Program
     public static async Task<int> Main(string[] args)
     {
         var configDir = Environment.GetEnvironmentVariable("ERGOPROXY_CONFIG_DIR") ??
-                        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".config", "ergoproxy");
+                        (OperatingSystem.IsWindows()
+                            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ergoproxy")
+                            : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".config", "ergoproxy"));
 
         var profileRepo = new JsonProfileRepository(Path.Combine(configDir, "profiles.json"));
         var stateManager = new JsonStateManager(Path.Combine(configDir, "state.json"));
@@ -90,7 +92,7 @@ public static class Program
     private static async Task<int> RunRecoverAsync(IStateManager stateManager)
     {
         Console.WriteLine("Cleaning stale routing rules, TUN interfaces, and DNS configuration...");
-        var platform = new LinuxTunnelPlatform();
+        var platform = TunnelPlatformFactory.Create();
         await platform.CleanStaleStateAsync(new TunnelAddressing());
 
         var state = await stateManager.GetStateAsync();

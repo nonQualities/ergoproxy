@@ -49,7 +49,14 @@ public sealed class TcpRelay : IAsyncDisposable
         }
         catch (SocketException)
         {
-            _listener.Bind(new IPEndPoint(IPAddress.Any, listenPort));
+            try
+            {
+                _listener.Bind(new IPEndPoint(IPAddress.Any, listenPort));
+            }
+            catch (SocketException)
+            {
+                _listener.Bind(new IPEndPoint(IPAddress.Any, 0));
+            }
         }
         _listener.Listen(1024);
         ListenPort = ((IPEndPoint)_listener.LocalEndPoint!).Port;
@@ -137,7 +144,15 @@ public sealed class TcpRelay : IAsyncDisposable
             {
                 Interlocked.Increment(ref _stats.DirectConnections);
                 upstreamSocket = new Socket(SocketType.Stream, ProtocolType.Tcp);
-                LinuxNative.SetMark(upstreamSocket, _addressing.FwMark);
+                if (OperatingSystem.IsLinux())
+                {
+                    LinuxNative.SetMark(upstreamSocket, _addressing.FwMark);
+                }
+                else if (OperatingSystem.IsWindows() && IPAddress.TryParse(targetHost, out var targetIp))
+                {
+                    var bestIf = WindowsNative.GetBestInterfaceFor(targetIp);
+                    if (bestIf.HasValue) WindowsNative.SetUnicastInterface(upstreamSocket, bestIf.Value);
+                }
                 await upstreamSocket.ConnectAsync(targetHost, destPort, ct).ConfigureAwait(false);
                 upstreamStream = new NetworkStream(upstreamSocket, ownsSocket: true);
             }

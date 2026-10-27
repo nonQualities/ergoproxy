@@ -67,6 +67,15 @@ public static class HttpProxyConnector
             }
 
             var endpoint = new IPEndPoint(addrs[0], proxyPort);
+            if (OperatingSystem.IsWindows())
+            {
+                var bestIf = WindowsNative.GetBestInterfaceFor(endpoint.Address);
+                if (bestIf.HasValue)
+                {
+                    WindowsNative.SetUnicastInterface(socket, bestIf.Value);
+                }
+            }
+
             await socket.ConnectAsync(endpoint, token).ConfigureAwait(false);
 
             // Construct HTTP CONNECT request

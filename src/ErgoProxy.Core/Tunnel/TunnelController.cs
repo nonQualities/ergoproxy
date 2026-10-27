@@ -31,7 +31,7 @@ public sealed class TunnelController : IAsyncDisposable
         Func<string, IPacketDevice>? deviceFactory = null)
     {
         _addressing = addressing ?? new TunnelAddressing();
-        _platform = platform ?? new LinuxTunnelPlatform();
+        _platform = platform ?? TunnelPlatformFactory.Create();
         _deviceFactory = deviceFactory;
     }
 
@@ -100,7 +100,7 @@ public sealed class TunnelController : IAsyncDisposable
             {
                 _device = _deviceFactory != null
                     ? _deviceFactory(_addressing.InterfaceName)
-                    : LinuxTunDevice.Open(_addressing.InterfaceName);
+                    : TunDeviceFactory.Create(_addressing.InterfaceName);
 
                 _natTable = new NatTable();
                 _fakeIpPool = new FakeIpPool(_addressing);
